@@ -9,14 +9,15 @@ import streamlit.components.v1 as components
 
 
 # --- 1. 辅助工具函数 ---
-def is_duration_col(col_name):
+def is_duration_col(col_name, custom_time_keywords=None):
     """
-    智能识别时长列：
-    包含：总、时长、时间、片长、总长、总片长
-    排除：上线、日期、发布、开播、年度、更新、date、day、总集数、总片数、总集
+    智能识别时间/时长列：
+    排除包含日期、上线、更新等不适合累加的干扰词
     """
-    include_k = ['总', '时长', '时间', '片长', '总长', '总片长']
-    exclude_k = ['上线', '日期', '发布', '开播', '年度', '更新', 'date', 'day', '总集数', '总片数', '总集']
+    include_k = custom_time_keywords if custom_time_keywords else ['总', '时长', '时间', '片长', '总长', '总片长',
+                                                                   'Duration', 'time']
+    exclude_k = ['上线', '日期', '发布', '开播', '年度', '更新', 'date', 'day', '总集数', '总片数', '总集', 'ID', '号',
+                 'No']
     is_inc = any(k in col_name for k in include_k)
     is_exc = any(k in col_name for k in exclude_k)
     return is_inc and not is_exc
@@ -41,14 +42,30 @@ def parse_time_logic(val):
         return v_str
 
 
-def find_headers(df):
-    """智能侦测表头所在行"""
+def find_headers(df, custom_keywords=None):
+    """
+    智能侦测表头所在行：
+    1. 根据特征词命中率打分
+    2. 评估文本长度和密度
+    3. 排除大部分是纯数字的干扰行
+    """
     best_idx, max_m = 0, -1
-    core = {'片单', '编码', '分类', '子分类', '时长', '时间', '产地', '简介', '版权', '导演', '演员'}
+    core = custom_keywords if custom_keywords else {'编码', '名称', '日期', '类型', '状态', '标题', '时间', 'ID',
+                                                    'Name', 'Date', 'Type'}
+
     for idx in range(min(10, len(df))):
         row = [str(x).strip() for x in df.iloc[idx].values if pd.notna(x)]
-        m = sum(2 if any(c in v for c in core) else 0.5 for v in row if len(v) > 1)
+        # 基础分：含有特征词权重极高，包含长度大于1的文本有基础分
+        m = sum(3 if any(c in v for c in core) else (0.8 if len(v) > 1 else 0) for v in row)
+
+        # 降噪：如果整行有一半以上是纯数字，说明大概率是数据行而非表头，扣除大分
+        if len(row) > 0:
+            num_count = sum(1 for v in row if v.replace('.', '', 1).isdigit())
+            if num_count / len(row) > 0.5:
+                m -= 5
+
         if m > max_m: max_m, best_idx = m, idx
+
     h = [str(x).strip() for x in df.iloc[best_idx].values]
     return best_idx, [x for x in h if x and x != 'nan' and not x.startswith('Unnamed:')]
 
@@ -64,7 +81,7 @@ st.markdown("""
 
 ✅ 已实现自动对齐，即 字段/表头字面完全一样、或相似度较高的，系统会自动处理。
 
-✅ 已考虑到个别电视剧总时长会超过24小时的情况。
+✅ 已考虑到个别数据总时长会超过24小时（如长剧集、系列课程、累计工时）的情况。
 
 ---
 
@@ -72,12 +89,12 @@ st.markdown("""
 
 * **自定义填充：** 如果A表没有B表某字段（表B字段比A多），你可以为这些字段设置不同的默认内容，不设置视为空。（详见左侧第 1 点）
 * **无表头预警：** 如果A表某列无表头但该列有内容，传完表A后见下方提示，可见左侧第2点手动对号修正；
-* **特殊处理：** 只要字段里包含 “总”、“时长”、“时间”、“片长” 或 “总长”，系统就会默认时、分、秒的无限累计显示（`[h]:mm:ss`）（可取消）；
+* **特殊处理：** 只要字段满足时间特征，系统就会默认时、分、秒的无限累计显示（`[h]:mm:ss`）（可取消）；
 * **求助与售后 (Help & Support)：** * 🔍 **自查格式**：报错转换失败先自查表b表头在哪一行，见左侧第3点自查—表B表头行号修正。
     * 🔄 **页面卡顿/未刷新**：可点击网页最右上角 **三点菜单 (Three-dot Menu `⋮`)**：
         * 👉 选择 **Rerun (重新运行)** 强制页面刷新重算。
         * 👉 选择 **Clear cache (清除缓存)** 清空之前的表格记忆（上传新模板疯狂报错时必点）。
-    * 🧑‍💻 **联系售后**：若尝试上述方法仍未解决，请点击底部【排错专区】的复制按钮，将报错信息发还给 **戈伶玉**。
+    * 🧑‍💻 **联系售后**：若尝试上述方法仍未解决，请点击底部【排错专区】的复制按钮，将报错信息发给 **nolinda@126.com**。
 """)
 
 # --- 4. 侧边栏：1. 个性化默认值填充 ---
@@ -148,12 +165,28 @@ if raw_file:
         st.error(f"读取表A失败: {e}")
         st.stop()
 
-# ==================== 8. 侧边栏：3. 自查—表B表头行号修正与时间转换 ====================
+# ==================== 8. 侧边栏：3. 自查与特征词自定义 ====================
 selected_time_cols = []
 force_header_config = {}
 
 st.sidebar.markdown("---")
 st.sidebar.header("🔍 3. 自查—表B表头行号修正")
+
+# 让用户可以完全动态自定义表头特征词
+header_keywords_input = st.sidebar.text_input(
+    "🧠 自定义表头定位特征词 (逗号隔开)",
+    value="编码,名称,日期,类型,状态,标题,时间,片单,导演,演员,ID,Name,Date,Type",
+    help="系统会根据这些核心词在表格前10行中自动定位最像表头的那一行。支持任何行业词汇。"
+)
+custom_header_keywords = set(x.strip() for x in header_keywords_input.replace("，", ",").split(",") if x.strip())
+
+# 让用户可以完全动态自定义时间列特征词
+time_keywords_input = st.sidebar.text_input(
+    "⏳ 自定义时间列特征词 (逗号隔开)",
+    value="总,时长,时间,片长,总长,总片长,Duration,time",
+    help="表头只要包含这些词，就会被默认勾选进入 [h]:mm:ss 的无限时间累加转换。"
+)
+custom_time_keywords = [x.strip() for x in time_keywords_input.replace("，", ",").split(",") if x.strip()]
 
 if template_file:
     xls_tpl = pd.ExcelFile(template_file)
@@ -174,8 +207,8 @@ if template_file:
     for s_name in xls_tpl.sheet_names:
         try:
             df_preview = pd.read_excel(xls_tpl, sheet_name=s_name, header=None, nrows=10)
-            _, hs = find_headers(df_preview)
-            all_time_cols_in_template.extend([h for h in hs if is_duration_col(h)])
+            _, hs = find_headers(df_preview, custom_header_keywords)
+            all_time_cols_in_template.extend([h for h in hs if is_duration_col(h, custom_time_keywords)])
         except:
             pass
     all_time_cols_in_template = list(set(all_time_cols_in_template))
@@ -201,7 +234,7 @@ if df_raw is not None and template_file:
 
             f_h = force_header_config.get(s_name, 0)
             h_idx, headers = (f_h - 1, [str(x).strip() for x in df_tpl_meta.iloc[f_h - 1].values if
-                                        pd.notna(x)]) if f_h > 0 else find_headers(df_tpl_meta)
+                                        pd.notna(x)]) if f_h > 0 else find_headers(df_tpl_meta, custom_header_keywords)
 
             out_df = pd.DataFrame(columns=headers)
             raw_cols = df_raw.columns.tolist()
@@ -296,7 +329,7 @@ if df_raw is not None and template_file:
         document.getElementById('copy-btn').addEventListener('click', function() {{
             const text = decodeB64('{b64_json}');
             navigator.clipboard.writeText(text).then(function() {{
-                alert('复制成功！排错日志已成功保存，快去发给戈伶玉吧~');
+                alert('复制成功！排错日志已成功保存，快去发给 nolinda@126.com 吧~');
             }}, function(err) {{
                 // 应急方案
                 const textArea = document.createElement("textarea");
