@@ -24,7 +24,7 @@
 
  1. 在线使用 (免安装直接白嫖)
 不用懂代码，直接点击下方链接即可在浏览器中使用：
-👉 [点击体验：万能 Excel 提取助手](https://sophia-excel-format-transformer.streamlit.app)**
+👉 [点击体验：万能 Excel 提取助手](https://sophia-excel-format-transformer.streamlit.app)
 
  2. 本地部署 (开发者专区)
 如果你想把这个工具部署在自己的电脑或公司服务器上，请自取源码：
