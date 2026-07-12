@@ -128,26 +128,34 @@ with col_u2:
 
 # ==================== 7. 读取表A与无头预警 ====================
 df_raw = None
+raw_sheets = {} # 用于存储表A可能包含的多个Sheet
 if raw_file:
     try:
         ext = raw_file.name.split('.')[-1].lower()
         if ext == 'csv':
             df_raw = pd.read_csv(raw_file, dtype=str).fillna("")
+            raw_sheets["Sheet1"] = df_raw
         else:
-            df_raw = pd.read_excel(raw_file, dtype=str).fillna("")
-        st.success(f"✅ 表A 读取成功！共包含 {len(df_raw.columns)} 列数据。")
+            xls_raw = pd.ExcelFile(raw_file)
+            for s in xls_raw.sheet_names:
+                raw_sheets[s] = pd.read_excel(xls_raw, sheet_name=s, dtype=str).fillna("")
+            df_raw = list(raw_sheets.values())[0] # 仅作下方非空判定兜底使用
+            
+        st.success(f"✅ 表A 读取成功！共读取 {len(raw_sheets)} 个 Sheet。")
         
         # 提取无名列预览
         unnamed = []
-        for i, col in enumerate(df_raw.columns, 1):
-            if "Unnamed" in str(col) or str(col).strip() == "":
-                sample = [str(x).strip() for x in df_raw.iloc[:, i-1].tolist() if str(x).strip() != ""]
-                unnamed.append((i, "、".join(sample[:3]) if sample else "全空"))
+        for s_name, df_s in raw_sheets.items():
+            for i, col in enumerate(df_s.columns, 1):
+                if "Unnamed" in str(col) or str(col).strip() == "":
+                    sample = [str(x).strip() for x in df_s.iloc[:, i-1].tolist() if str(x).strip() != ""]
+                    unnamed.append((s_name, i, "、".join(sample[:3]) if sample else "全空"))
         
         if unnamed:
             st.warning("🚨 **表A 发现无名列！** 请根据内容预览，在左侧【手动对号修正】区指定列号：")
-            for idx, pre in unnamed: 
-                st.write(f"👉 表A 第 `{idx}` 列 ➔ 内容预览: `{pre}`")
+            for s_name, idx, pre in unnamed: 
+                sheet_prefix = f"『{s_name}』 " if len(raw_sheets) > 1 else ""
+                st.write(f"👉 表A {sheet_prefix}第 `{idx}` 列 ➔ 内容预览: `{pre}`")
     except Exception as e: 
         st.error(f"读取表A失败: {e}")
         st.stop()
@@ -211,18 +219,32 @@ else:
 if df_raw is not None and template_file:
     output = BytesIO()
     final_reports = {}
-    debug_log = {"源表字段": df_raw.columns.tolist(), "诊断": {}}
+    debug_log = {"诊断": {}}
 
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
-        for s_name in xls_tpl.sheet_names:
+        for b_idx_sheet, s_name in enumerate(xls_tpl.sheet_names):
             df_tpl_meta = pd.read_excel(xls_tpl, sheet_name=s_name, header=None, nrows=10)
             if df_tpl_meta.empty: continue
+            
+            # ------ 智能寻找对应的 表A Sheet ------
+            if len(raw_sheets) == 1:
+                current_df_raw = list(raw_sheets.values())[0]
+            else:
+                if s_name in raw_sheets:
+                    current_df_raw = raw_sheets[s_name]
+                else:
+                    a_sheet_names = list(raw_sheets.keys())
+                    if b_idx_sheet < len(a_sheet_names):
+                        current_df_raw = raw_sheets[a_sheet_names[b_idx_sheet]]
+                    else:
+                        current_df_raw = pd.DataFrame() # 没找到对应Sheet，兜底为空表
+            # ------------------------------------
             
             f_h = force_header_config.get(s_name, 0)
             h_idx, headers = (f_h-1, [str(x).strip() for x in df_tpl_meta.iloc[f_h-1].values if pd.notna(x)]) if f_h > 0 else find_headers(df_tpl_meta, custom_header_keywords)
             
             out_df = pd.DataFrame(columns=headers)
-            raw_cols = df_raw.columns.tolist()
+            raw_cols = current_df_raw.columns.tolist()
             report = []
             
             for b_idx, col_name in enumerate(headers, 1):
@@ -236,8 +258,8 @@ if df_raw is not None and template_file:
                     m = difflib.get_close_matches(col_name, raw_cols, n=1, cutoff=0.4)
                     if m: a_idx = raw_cols.index(m[0]); status = "ok"
                 
-                if status == "ok" and a_idx < len(df_raw.columns):
-                    series = df_raw.iloc[:, a_idx]
+                if status == "ok" and a_idx < len(current_df_raw.columns):
+                    series = current_df_raw.iloc[:, a_idx]
                     if col_name in selected_time_cols:
                         series = series.apply(parse_time_logic)
                     out_df[col_name] = series
@@ -258,7 +280,7 @@ if df_raw is not None and template_file:
                             cell.number_format = '[h]:mm:ss'
             
             final_reports[s_name] = report
-            debug_log["诊断"][s_name] = {"识别行": h_idx+1, "字段": headers}
+            debug_log["诊断"][s_name] = {"识别行": h_idx+1, "表A对应字段": raw_cols, "表B字段": headers}
 
     st.markdown("---")
     st.subheader("📊 数据对齐与填充看板 (表A ➡️ 表B)")
@@ -337,4 +359,4 @@ if df_raw is not None and template_file:
         st.code(log_json, language="json")
 else:
     # 没传文件时的默认占位显示
-    st.info("💡 请在上方上传【表A】、【表B】。") 
+    st.info("💡 请在上方上传【表A】、【表B】。")
