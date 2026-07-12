@@ -9,134 +9,332 @@ import streamlit.components.v1 as components
 
 # --- 1. 辅助工具函数 ---
 def is_duration_col(col_name, custom_time_keywords=None):
+    """
+    智能识别时间/时长列：
+    排除包含日期、上线、更新等不适合累加的干扰词
+    """
     include_k = custom_time_keywords if custom_time_keywords else ['总', '时长', '时间', '片长', '总长', '总片长', 'Duration', 'time']
     exclude_k = ['上线', '日期', '发布', '开播', '年度', '更新', 'date', 'day', '总集数', '总片数', '总集', 'ID', '号', 'No']
-    is_inc = any(k in str(col_name) for k in include_k)
-    is_exc = any(k in str(col_name) for k in exclude_k)
+    is_inc = any(k in col_name for k in include_k)
+    is_exc = any(k in col_name for k in exclude_k)
     return is_inc and not is_exc
 
 def parse_time_logic(val):
+    """支持超过 24 小时的时间数据强制解析"""
     if pd.isna(val) or val == "": return ""
     v_str = str(val).strip()
     if ':' in v_str:
         parts = v_str.split(':')
         try:
-            if len(parts) == 3:
+            if len(parts) == 3: # HH:MM:SS 格式
                 return (int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])) / 86400.0
-            elif len(parts) == 2:
+            elif len(parts) == 2: # MM:SS 格式
                 return (int(parts[0]) * 60 + int(parts[1])) / 84600.0
         except: pass
     try: return float(v_str)
     except: return v_str
 
 def find_headers(df, custom_keywords=None):
+    """
+    智能侦测表头所在行：
+    1. 根据特征词命中率打分
+    2. 评估文本长度和密度
+    3. 排除大部分是纯数字的干扰行
+    """
     best_idx, max_m = 0, -1
     core = custom_keywords if custom_keywords else {'编码', '名称', '日期', '类型', '状态', '标题', '时间', 'ID', 'Name', 'Date', 'Type'}
     
-    for idx in range(min(15, len(df))):
+    for idx in range(min(10, len(df))):
         row = [str(x).strip() for x in df.iloc[idx].values if pd.notna(x)]
+        # 基础分：含有特征词权重极高，包含长度大于1的文本有基础分
         m = sum(3 if any(c in v for c in core) else (0.8 if len(v)>1 else 0) for v in row)
+        
+        # 降噪：如果整行有一半以上是纯数字，说明大概率是数据行而非表头，扣除大分
         if len(row) > 0:
             num_count = sum(1 for v in row if v.replace('.','',1).isdigit())
-            if num_count / len(row) > 0.6: m -= 5
+            if num_count / len(row) > 0.5:
+                m -= 5
+                
         if m > max_m: max_m, best_idx = m, idx
-    
-    h_row = df.iloc[best_idx].values
-    clean_h = [str(x).strip() if pd.notna(x) else f"Unnamed: {i}" for i, x in enumerate(h_row)]
-    return best_idx, clean_h
+        
+    h = [str(x).strip() for x in df.iloc[best_idx].values]
+    return best_idx, [x for x in h if x and x != 'nan' and not x.startswith('Unnamed:')]
 
-# --- 2. 页面配置 ---
-st.set_page_config(page_title="万能 Excel 表头提取助手", layout="wide", page_icon="🔀")
+# --- 2. 页面基本配置 ---
+st.set_page_config(page_title="万能 Excel 表头提取与排版助手", layout="wide", page_icon="🔀")
 
-# --- 3. 顶部说明 ---
+# --- 3. 顶部说明区 ---
 st.title("🔀 万能 Excel 表头提取与排版助手")
-st.markdown(f"""
-✅ 解决 B 表字段与 A 表字段对应提取转换问题，支持相似度自动对齐。
-✅ **[h]:mm:ss** 累计时长自动转换，无视 24 小时进位限制。
+
+st.markdown("""
+✅ 此网页主要解决 Excel 表头/字段对应提取转换（B表字段 and A表字段大部分重合）的问题。
+
+✅ 已实现自动对齐，即 字段/表头字面完全一样、或相似度较高的，系统会自动处理。
+
+✅ 已考虑到个别数据总时长会超过24小时（如长剧集、系列课程、累计工时）的情况。
+
 ---
-📬 **联系售后**：若遇报错，请点击底部【排错专区】复制日志并发送至 **nolinda@126.com**。
+
+系统会自动把 **【表A（原始数据）】** 里的数据提取/筛选并填入 **【表b（带有你需要格式、字段/表头的模版）】** 里，**最终导出的 Sheet 将完全沿用表b的结构与命名。**
+
+* **自定义填充：** 如果A表没有B表某字段（表B字段比A多），你可以为这些字段设置不同的默认内容，不设置视为空。（详见左侧第 1 点）
+* **无表头预警：** 如果A表某列无表头但该列有内容，传完表A后见下方提示，可见左侧第2点手动对号修正；
+* **特殊处理：** 只要字段满足时间特征，系统就会默认时、分、秒的无限累计显示（`[h]:mm:ss`）（可取消）；
+* **求助与售后 (Help & Support)：** * 🔍 **自查格式**：报错转换失败先自查表b表头在哪一行，见左侧第3点自查—表B表头行号修正。
+    * 🔄 **页面卡顿/未刷新**：可点击网页最右上角 **三点菜单 (Three-dot Menu `⋮`)**：
+        * 👉 选择 **Rerun (重新运行)** 强制页面刷新重算。
+        * 👉 选择 **Clear cache (清除缓存)** 清空之前的表格记忆（上传新模板疯狂报错时必点）。
+    * 🧑‍💻 **联系售后**：若尝试上述方法仍未解决，请点击底部【排错专区】的复制按钮，将报错信息发给 **nolinda@126.com**。
 """)
 
-# --- 4. 侧边栏配置 ---
-st.sidebar.header("⚙️ 参数配置")
-header_keywords_input = st.sidebar.text_input("🧠 表头定位特征词", value="编码,名称,日期,类型,状态,标题,时间,ID")
-custom_header_keywords = set(x.strip() for x in header_keywords_input.replace("，", ",").split(",") if x.strip())
+# --- 4. 侧边栏：1. 个性化默认值填充 ---
+st.sidebar.header("⚙️ 1. 个性化默认值填充")
+st.sidebar.info("👉 **用法：** 表B字段名=你要填的内容。每行一个。未设置的字段为空。")
+today_str = datetime.datetime.now().strftime("%y%m%d")
+custom_defaults_text = st.sidebar.text_area("输入填充规则：", placeholder=f"更新日期={today_str}\n是否成品=是", height=150)
 
-time_keywords_input = st.sidebar.text_input("⏳ 时长识别特征词", value="总,时长,时间,片长,总长,Duration")
-custom_time_keywords = [x.strip() for x in time_keywords_input.replace("，", ",").split(",") if x.strip()]
+# 解析多字段默认值
+custom_defaults = {}
+if custom_defaults_text.strip():
+    for line in custom_defaults_text.split('\n'):
+        if '=' in line:
+            parts = line.split('=')
+            if len(parts) == 2:
+                custom_defaults[parts[0].strip()] = parts[1].strip()
 
+# --- 5. 侧边栏：2. 手动对号修正 ---
 st.sidebar.markdown("---")
-st.sidebar.header("🛠️ 手动修正与默认填充")
-custom_defaults_text = st.sidebar.text_area("1. 默认填充 (字段=内容)", placeholder="更新日期=260511", height=100)
-manual_map_text = st.sidebar.text_area("2. 手动对号 (B字段=A列号)", placeholder="许可证=10", height=100)
+st.sidebar.header("🛠️ 2. 手动对号修正")
+st.sidebar.info("👉 **用法：** 表B字段名=表A列号。例如：UMAI=58(表b叫umail的列 对应的是表a第58列），输入完按回车键或在空白处点一下即可生效。")
+manual_map_text = st.sidebar.text_area("输入映射规则（不区分大小写）：", placeholder="许可证=10", height=120)
 
-# 解析配置
-custom_defaults = {l.split('=')[0].strip(): l.split('=')[1].strip() for l in custom_defaults_text.split('\n') if '=' in l}
-manual_map_config = {l.split('=')[0].strip().lower(): int(l.split('=')[1].strip())-1 for l in manual_map_text.split('\n') if '=' in l and l.split('=')[1].strip().isdigit()}
+# 解析手动映射规则 (忽略大小写)
+manual_map_config = {}
+if manual_map_text.strip():
+    for line in manual_map_text.split('\n'):
+        if '=' in line:
+            parts = line.split('=')
+            if len(parts) == 2:
+                try: 
+                    manual_map_config[parts[0].strip().lower()] = int(parts[1].strip()) - 1
+                except ValueError: pass
 
-# --- 5. 文件上传与逻辑处理 ---
-u1, u2 = st.columns(2)
-with u1: raw_file = st.file_uploader("📂 上传【表 A：源数据】", type=["csv", "xlsx", "xls"])
-with u2: template_file = st.file_uploader("📋 上传【表 B：目标模板】", type=["xlsx", "xls"])
+# --- 6. 主界面：文件上传 ---
+col_u1, col_u2 = st.columns(2)
+with col_u1:
+    raw_file = st.file_uploader("📂 上传【表A：数据源】(系统导出的原始表)", type=["csv", "xlsx", "xls"])
+with col_u2:
+    template_file = st.file_uploader("📋 上传【表B：目标模板】(带有目标格式的模版)", type=["xlsx", "xls"])
 
+# ==================== 7. 读取表A与无头预警 ====================
 df_raw = None
 if raw_file:
     try:
-        # 智能侦测表 A 的表头位置
-        temp_df = pd.read_excel(raw_file, header=None, nrows=20, dtype=str).fillna("") if not raw_file.name.endswith('.csv') else pd.read_csv(raw_file, header=None, nrows=20, dtype=str).fillna("")
-        a_h_idx, _ = find_headers(temp_df, custom_header_keywords)
+        ext = raw_file.name.split('.')[-1].lower()
+        if ext == 'csv':
+            df_raw = pd.read_csv(raw_file, dtype=str).fillna("")
+        else:
+            df_raw = pd.read_excel(raw_file, dtype=str).fillna("")
+        st.success(f"✅ 表A 读取成功！共包含 {len(df_raw.columns)} 列数据。")
         
-        # 重新加载完整表 A
-        raw_file.seek(0)
-        df_raw = pd.read_excel(raw_file, header=a_h_idx, dtype=str).fillna("") if not raw_file.name.endswith('.csv') else pd.read_csv(raw_file, header=a_h_idx, dtype=str).fillna("")
-        st.success(f"✅ 表 A 读取成功 (从第 {a_h_idx+1} 行识别表头)")
-
-        # 无名列预警逻辑
+        # 提取无名列预览
         unnamed = []
         for i, col in enumerate(df_raw.columns, 1):
-            col_str = str(col).strip()
-            if "Unnamed" in col_str or col_str == "" or col_str.startswith("Column"):
+            if "Unnamed" in str(col) or str(col).strip() == "":
                 sample = [str(x).strip() for x in df_raw.iloc[:, i-1].tolist() if str(x).strip() != ""]
                 unnamed.append((i, "、".join(sample[:3]) if sample else "全空"))
         
         if unnamed:
-            st.warning("🚨 **表 A 发现无名列！** 系统无法自动匹配这些列，请在左侧【手动对号】输入列号：")
-            for idx, pre in unnamed: st.write(f"👉 第 `{idx}` 列 ➔ 内容预览: `{pre}`")
-    except Exception as e: st.error(f"读取表 A 失败: {e}")
+            st.warning("🚨 **表A 发现无名列！** 请根据内容预览，在左侧【手动对号修正】区指定列号：")
+            for idx, pre in unnamed: 
+                st.write(f"👉 表A 第 `{idx}` 列 ➔ 内容预览: `{pre}`")
+    except Exception as e: 
+        st.error(f"读取表A失败: {e}")
+        st.stop()
 
+# ==================== 8. 侧边栏：3. 自查与特征词自定义 ====================
+selected_time_cols = []
+force_header_config = {}
+
+st.sidebar.markdown("---")
+st.sidebar.header("🔍 3. 自查—表B表头行号修正")
+
+# 让用户可以完全动态自定义表头特征词
+header_keywords_input = st.sidebar.text_input(
+    "🧠 自定义表头定位特征词 (逗号隔开)",
+    value="编码,名称,日期,类型,状态,标题,时间,片单,导演,演员,ID,Name,Date,Type",
+    help="系统会根据这些核心词在表格前10行中自动定位最像表头的那一行。支持任何行业词汇。"
+)
+custom_header_keywords = set(x.strip() for x in header_keywords_input.replace("，", ",").split(",") if x.strip())
+
+# 让用户可以完全动态自定义时间列特征词
+time_keywords_input = st.sidebar.text_input(
+    "⏳ 自定义时间列特征词 (逗号隔开)",
+    value="总,时长,时间,片长,总长,总片长,Duration,time",
+    help="表头只要包含这些词，就会被默认勾选进入 [h]:mm:ss 的无限时间累加转换。"
+)
+custom_time_keywords = [x.strip() for x in time_keywords_input.replace("，", ",").split(",") if x.strip()]
+
+if template_file:
+    xls_tpl = pd.ExcelFile(template_file)
+    
+    # 动态渲染 Sheet 的表头行号输入（表B第几行）
+    for s_name in xls_tpl.sheet_names:
+        force_header_config[s_name] = st.sidebar.number_input(
+            f"『{s_name}』的字段名在表B第几行？", 
+            min_value=0, max_value=20, value=0, 
+            key=f"row_{s_name}"
+        )
+    
+    # ⏳ 时间格式转换确认 (紧随在第3点自查后面)
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("⏳ 时间格式转换确认")
+    
+    all_time_cols_in_template = []
+    for s_name in xls_tpl.sheet_names:
+        try:
+            df_preview = pd.read_excel(xls_tpl, sheet_name=s_name, header=None, nrows=10)
+            _, hs = find_headers(df_preview, custom_header_keywords)
+            all_time_cols_in_template.extend([h for h in hs if is_duration_col(h, custom_time_keywords)])
+        except: pass
+    all_time_cols_in_template = list(set(all_time_cols_in_template))
+    
+    selected_time_cols = st.sidebar.multiselect(
+        "以下字段将执行 [h]:mm:ss 累加转换", 
+        all_time_cols_in_template, 
+        default=all_time_cols_in_template
+    )
+else:
+    st.sidebar.caption("⏳ 上传【表B】后，即可在此进行行号自查与时间列转换设置。")
+
+# ==================== 9. 执行核心映射与渲染看板 ====================
 if df_raw is not None and template_file:
     output = BytesIO()
-    xls_tpl = pd.ExcelFile(template_file)
+    final_reports = {}
+    debug_log = {"源表字段": df_raw.columns.tolist(), "诊断": {}}
+
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
         for s_name in xls_tpl.sheet_names:
-            df_tpl_meta = pd.read_excel(xls_tpl, sheet_name=s_name, header=None, nrows=15).fillna("")
-            h_idx, headers = find_headers(df_tpl_meta, custom_header_keywords)
+            df_tpl_meta = pd.read_excel(xls_tpl, sheet_name=s_name, header=None, nrows=10)
+            if df_tpl_meta.empty: continue
+            
+            f_h = force_header_config.get(s_name, 0)
+            h_idx, headers = (f_h-1, [str(x).strip() for x in df_tpl_meta.iloc[f_h-1].values if pd.notna(x)]) if f_h > 0 else find_headers(df_tpl_meta, custom_header_keywords)
             
             out_df = pd.DataFrame(columns=headers)
             raw_cols = df_raw.columns.tolist()
-            time_cols_to_format = [h for h in headers if is_duration_col(h, custom_time_keywords)]
+            report = []
             
-            for col_name in headers:
-                a_idx = manual_map_config.get(col_name.lower())
-                if a_idx is None:
-                    m = difflib.get_close_matches(col_name, raw_cols, n=1, cutoff=0.4)
-                    if m: a_idx = raw_cols.index(m[0])
+            for b_idx, col_name in enumerate(headers, 1):
+                a_idx, status = None, "empty"
                 
-                if a_idx is not None and a_idx < len(df_raw.columns):
-                    series = df_raw.iloc[:, a_idx]
-                    if col_name in time_cols_to_format: series = series.apply(parse_time_logic)
-                    out_df[col_name] = series
+                # 优先级1：手动列号映射（忽略大小写）
+                if col_name.lower() in manual_map_config:
+                    a_idx = manual_map_config[col_name.lower()]; status = "ok"
+                # 优先级2：自动相似度对齐
                 else:
-                    out_df[col_name] = custom_defaults.get(col_name, "")
+                    m = difflib.get_close_matches(col_name, raw_cols, n=1, cutoff=0.4)
+                    if m: a_idx = raw_cols.index(m[0]); status = "ok"
+                
+                if status == "ok" and a_idx < len(df_raw.columns):
+                    series = df_raw.iloc[:, a_idx]
+                    if col_name in selected_time_cols:
+                        series = series.apply(parse_time_logic)
+                    out_df[col_name] = series
+                    report.append({"b": b_idx, "bn": col_name, "a": a_idx + 1, "an": raw_cols[a_idx], "s": "ok"})
+                else:
+                    fill = custom_defaults.get(col_name, "")
+                    out_df[col_name] = fill
+                    report.append({"b": b_idx, "bn": col_name, "f": fill, "s": "fill" if fill else "empty"})
             
             out_df.to_excel(writer, sheet_name=s_name, index=False)
-            # 格式化时间列
             ws = writer.sheets[s_name]
             for i, h in enumerate(headers, 1):
-                if h in time_cols_to_format:
+                if h in selected_time_cols:
+                    ws.column_dimensions[ws.cell(row=1, column=i).column_letter].width = 14
                     for r in range(2, len(out_df)+2):
                         cell = ws.cell(row=r, column=i)
-                        if isinstance(cell.value, (float, int)): cell.number_format = '[h]:mm:ss'
+                        if isinstance(cell.value, (float, int)): 
+                            cell.number_format = '[h]:mm:ss'
+            
+            final_reports[s_name] = report
+            debug_log["诊断"][s_name] = {"识别行": h_idx+1, "字段": headers}
+
+    st.markdown("---")
+    st.subheader("📊 数据对齐与填充看板 (表A ➡️ 表B)")
+
+    for s_name, report in final_reports.items():
+        ok_count = sum(1 for x in report if x['s'] == 'ok')
+        with st.expander(f"📁 『{s_name}』 预览 (提取成功: {ok_count} | 填充/留空: {len(report)-ok_count})"):
+            c1, c2 = st.columns(2)
+            with c1:
+                st.write("🟢 **a表提取成功**")
+                for x in [item for item in report if item['s'] == 'ok']:
+                    st.write(f"A第`{x['a']}`列({x['an']}) ➔ B第`{x['b']}`列({x['bn']})")
+                if not any(item['s'] == 'ok' for item in report):
+                    st.caption("没有成功从表A提取的数据。")
+            with c2:
+                st.write("🟡 **b表填充或空**")
+                for x in [item for item in report if item['s'] != 'ok']:
+                    val_text = f"填: `{x['f']}`" if x['f'] else "留空"
+                    st.write(f"B第`{x['b']}`列({x['bn']}) ➔ {val_text}")
 
     st.success("🎉 处理完成！")
-    st.download_button("📥 下载交付表", data=output.getvalue(), file_name=f"Result_{datetime.datetime.now().strftime('%y%m%d')}.xlsx")
+    st.download_button("📥 下载转换后的交付 Excel", data=output.getvalue(), file_name=f"交付表_{today_str}.xlsx")
+    
+    # --- 10. 排错专区诊断日志与一键复制组件 ---
+    st.markdown("---")
+    with st.expander("🛠️ 排错专区 (遇到问题请复制此段)"):
+        # 将诊断日志转换为格式化JSON与加密Base64字符串
+        log_json = json.dumps(debug_log, ensure_ascii=False, indent=2)
+        b64_json = base64.b64encode(log_json.encode('utf-8')).decode('utf-8')
+        
+        # 页面注入带有JS监听和优雅动画的复制按钮
+        copy_html = f"""
+        <div style="text-align: right; margin-bottom: -15px;">
+            <button id="copy-btn" style="
+                background-color: #ff4b4b; 
+                color: white; 
+                border: none; 
+                padding: 6px 14px; 
+                font-size: 13px; 
+                border-radius: 4px; 
+                cursor: pointer;
+                font-family: inherit;
+                font-weight: 500;
+            ">📋 一键复制全部错误信息</button>
+        </div>
+        <script>
+        function decodeB64(str) {{
+            return decodeURIComponent(atob(str).split('').map(function(c) {{
+                return '%' + ('00' + c.charCodeAt(0).toString(16)).slice(-2);
+            }}).join(''));
+        }}
+        document.getElementById('copy-btn').addEventListener('click', function() {{
+            const text = decodeB64('{b64_json}');
+            navigator.clipboard.writeText(text).then(function() {{
+                alert('复制成功！排错日志已成功保存，快去发给 nolinda@126.com 吧~');
+            }}, function(err) {{
+                // 应急方案
+                const textArea = document.createElement("textarea");
+                textArea.value = text;
+                textArea.style.position = "fixed";
+                document.body.appendChild(textArea);
+                textArea.focus();
+                textArea.select();
+                try {{
+                    document.execCommand('copy');
+                    alert('复制成功！');
+                }} catch (err) {{
+                    alert('自动复制失败，请直接手动复制下方框内代码。');
+                }}
+                document.body.removeChild(textArea);
+            }});
+        }});
+        </script>
+        """
+        components.html(copy_html, height=45)
+        st.code(log_json, language="json")
+else:
+    # 没传文件时的默认占位显示
+    st.info("💡 请在上方上传【表A】、【表B】。")
