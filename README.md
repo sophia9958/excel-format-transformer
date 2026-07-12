@@ -1,7 +1,4 @@
-建议把 README 更新为下面这版。重点补充了多 Sheet 分流、分流规则、预览指标解释，以及“不确定就不乱写”的安全机制。
-
-:::writing{variant="document" id="73184"}
-# 🔀 万能 Excel 表头提取与匹配助手
+万能 Excel 表头提取与匹配助手
 
 还在用 VLOOKUP？
 
