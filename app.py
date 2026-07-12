@@ -325,22 +325,34 @@ if template_file:
             if any(col in p["body"].columns for p in template_profiles.values())
         ]
         st.sidebar.markdown("---")
-        st.sidebar.header("🧭 4. 多 Sheet 分流规则")
+        st.sidebar.header("🧭 4. 把表A数据分到表B不同 Sheet")
         st.sidebar.info(
-            "先选择用于分 Sheet 的字段，再给每个 Sheet 勾选允许值。"
-            "同一 Sheet 的多个字段必须同时满足；同一字段勾选多个值时满足任一即可。"
-            "已存在于表B的编码/名称仍会优先自动归属。"
+            "这一步是在告诉系统：表A的每一行，最后应该放进表B的哪个 Sheet。\n\n"
+            "**第1步：** 先选用表A的哪几列来判断，例如“分类”“地区”“部门”或“状态”。\n\n"
+            "**第2步：** 再打开下面每个表B Sheet，勾选它要接收哪些值。\n\n"
+            "**举例：** “华东区”Sheet 的“地区”勾选上海、江苏、浙江，"
+            "那么表A中地区是这三个值之一的数据，就会进入“华东区”。\n\n"
+            "同一列可以勾多个值，符合其中任意一个就算符合。\n\n"
+            "如果一个 Sheet 同时设置了“分类”和“地区”，一行数据必须两个条件都符合，才会放进去。\n\n"
+            "系统会参考表B原来的内容先帮你勾选一遍，你只需要检查和修改。\n\n"
+            "如果表B原来已经有相同的编码或名称，系统会优先认出它属于哪个 Sheet。"
         )
         route_fields = st.sidebar.multiselect(
-            "选择分 Sheet 字段",
+            "第1步：用表A的哪些列来分数据？",
             common_route_cols,
             default=[],
-            help="优先选择分类、部门、地区、渠道、状态等取值较少且能区分 Sheet 的字段。"
+            placeholder="点击这里选择字段",
+            help="选择真正能区分数据去向的列，例如分类、部门、地区、渠道或状态。一般选1～3个即可。"
         )
+
+        if not route_fields:
+            st.sidebar.warning("请先在上面选择至少一个分数据的字段，然后再设置每个 Sheet 接收哪些值。")
 
         for s_name in xls_tpl.sheet_names:
             routing_rules[s_name] = {}
-            with st.sidebar.expander(f"📁 『{s_name}』允许值", expanded=False):
+            with st.sidebar.expander(f"📁 表B『{s_name}』要接收哪些数据？", expanded=False):
+                if route_fields:
+                    st.caption("在下面勾选的值，就是这个 Sheet 可以接收的数据。")
                 for field in route_fields:
                     source_values = sorted({
                         str(v).strip() for v in df_raw[field].tolist()
@@ -356,7 +368,9 @@ if template_file:
                     # 默认勾选该 Sheet 模板中已经出现过、且表A也存在的值。
                     suggested = [v for v in source_values if normalize_text(v) in template_values]
                     chosen = st.multiselect(
-                        f"{field}", source_values, default=suggested,
+                        f"当表A的【{field}】是以下哪些值时，放进这里？",
+                        source_values, default=suggested,
+                        placeholder="请选择这个 Sheet 要接收的值",
                         key=f"route_{s_name}_{field}"
                     )
                     routing_rules[s_name][field] = {
