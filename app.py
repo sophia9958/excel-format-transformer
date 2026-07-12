@@ -60,6 +60,106 @@ def find_headers(df, custom_keywords=None):
     h = [str(x).strip() for x in df.iloc[best_idx].values]
     return best_idx, [x for x in h if x and x != 'nan' and not x.startswith('Unnamed:')]
 
+def normalize_text(value):
+    """用于跨 Sheet 比较的统一文本格式。"""
+    if pd.isna(value):
+        return ""
+    return str(value).strip().lower().replace(" ", "")
+
+def read_excel_sheets(excel_file):
+    """读取 Excel 中所有非空 Sheet；返回 {sheet名: DataFrame}。"""
+    xls = pd.ExcelFile(excel_file)
+    result = {}
+    for sheet_name in xls.sheet_names:
+        df = pd.read_excel(xls, sheet_name=sheet_name, dtype=str).fillna("")
+        if not df.empty:
+            result[sheet_name] = df
+    return result
+
+def build_template_profiles(xls_tpl, force_header_config, custom_header_keywords):
+    """读取表B每个 Sheet 的字段、原有数据和可用于分流的特征值。"""
+    profiles = {}
+    for sheet_name in xls_tpl.sheet_names:
+        meta = pd.read_excel(xls_tpl, sheet_name=sheet_name, header=None, nrows=10)
+        if meta.empty:
+            continue
+        forced = force_header_config.get(sheet_name, 0)
+        if forced > 0:
+            header_idx = forced - 1
+            headers = [str(x).strip() for x in meta.iloc[header_idx].values
+                       if pd.notna(x) and str(x).strip()]
+        else:
+            header_idx, headers = find_headers(meta, custom_header_keywords)
+        body = pd.read_excel(xls_tpl, sheet_name=sheet_name, header=header_idx,
+                             dtype=str).fillna("")
+        profiles[sheet_name] = {
+            "header_idx": header_idx,
+            "headers": headers,
+            "body": body,
+        }
+    return profiles
+
+def route_rows_to_template_sheets(df_raw, template_profiles, routing_rules=None):
+    """
+    把表A每一行只分配给表B的一个 Sheet。
+    先用编码/ID/名称等唯一字段精确匹配；模板尚无该条记录时，
+    再使用用户在页面上为各 Sheet 选择的通用字段和值进行筛选。
+    """
+    sheet_names = list(template_profiles)
+    routed_indices = {name: [] for name in sheet_names}
+    if len(sheet_names) <= 1:
+        if sheet_names:
+            routed_indices[sheet_names[0]] = df_raw.index.tolist()
+        return routed_indices, []
+
+    raw_cols = list(df_raw.columns)
+    identity_words = ("编码", "代码", "id", "编号", "名称", "标题", "name")
+    routing_rules = routing_rules or {}
+
+    # 提前缓存各 Sheet 每个共同字段中出现过的值，避免逐行重复计算。
+    value_sets = {}
+    for sheet_name, profile in template_profiles.items():
+        body = profile["body"]
+        value_sets[sheet_name] = {
+            col: {normalize_text(v) for v in body[col].tolist() if normalize_text(v)}
+            for col in raw_cols if col in body.columns
+        }
+
+    unresolved = []
+    for idx, row in df_raw.iterrows():
+        exact_hits = []
+        for sheet_name in sheet_names:
+            for col, values in value_sets[sheet_name].items():
+                col_lower = str(col).lower()
+                value = normalize_text(row[col])
+                if value and any(word in col_lower for word in identity_words) and value in values:
+                    exact_hits.append(sheet_name)
+                    break
+
+        # 唯一字段只命中一个 Sheet 时，归属最可靠。
+        unique_hits = list(dict.fromkeys(exact_hits))
+        if len(unique_hits) == 1:
+            routed_indices[unique_hits[0]].append(idx)
+            continue
+
+        rule_hits = []
+        for sheet_name in sheet_names:
+            rules = routing_rules.get(sheet_name, {})
+            # 该 Sheet 至少要配置一个字段；多个字段是 AND，同字段多值是 OR。
+            active_rules = {col: values for col, values in rules.items() if values}
+            if active_rules and all(
+                col in row.index and normalize_text(row[col]) in values
+                for col, values in active_rules.items()
+            ):
+                rule_hits.append(sheet_name)
+
+        if len(rule_hits) == 1:
+            routed_indices[rule_hits[0]].append(idx)
+        else:
+            unresolved.append(idx)
+
+    return routed_indices, unresolved
+
 # --- 2. 页面基本配置 ---
 st.set_page_config(page_title="万能 Excel 表头提取与排版助手", layout="wide", page_icon="🔀")
 
@@ -128,15 +228,22 @@ with col_u2:
 
 # ==================== 7. 读取表A与无头预警 ====================
 df_raw = None
+raw_sheet_names = []
 if raw_file:
     try:
         ext = raw_file.name.split('.')[-1].lower()
         if ext == 'csv':
             df_raw = pd.read_csv(raw_file, dtype=str).fillna("")
+            raw_sheet_names = [raw_file.name]
         else:
-            # 明确逻辑：无论表A有多少个Sheet，我们只读取第一个作为唯一的数据源
-            df_raw = pd.read_excel(raw_file, dtype=str).fillna("")
-        st.success(f"✅ 表A 读取成功！共包含 {len(df_raw.columns)} 列数据。")
+            raw_sheets = read_excel_sheets(raw_file)
+            raw_sheet_names = list(raw_sheets)
+            # 表A有多个 Sheet 时统一参与分流；同名字段自动纵向合并。
+            df_raw = pd.concat(raw_sheets.values(), ignore_index=True, sort=False).fillna("")
+        st.success(
+            f"✅ 表A 读取成功！共 {len(df_raw)} 条、{len(df_raw.columns)} 列"
+            f"，有效 Sheet：{len(raw_sheet_names)} 个。"
+        )
         
         # 提取无名列预览
         unnamed = []
@@ -156,9 +263,11 @@ if raw_file:
 # ==================== 8. 侧边栏：3. 自查与特征词自定义 ====================
 selected_time_cols = []
 force_header_config = {}
+routing_rules = {}
+template_profiles = {}
 
 st.sidebar.markdown("---")
-st.sidebar.header("🔍 3. 自查—表B各Sheet表头行号修正")
+st.sidebar.header("🔍 3. 自查—表B表头行号修正")
 
 # 让用户可以完全动态自定义表头特征词
 header_keywords_input = st.sidebar.text_input(
@@ -179,12 +288,10 @@ custom_time_keywords = [x.strip() for x in time_keywords_input.replace("，", ",
 if template_file:
     xls_tpl = pd.ExcelFile(template_file)
     
-    st.sidebar.info(f"检测到表B共有 {len(xls_tpl.sheet_names)} 个 Sheet，请确认它们各自的表头在哪一行：")
-    
-    # 动态渲染表B所有 Sheet 的表头行号输入，有几个就渲染几个！
+    # 动态渲染 Sheet 的表头行号输入（表B第几行）
     for s_name in xls_tpl.sheet_names:
         force_header_config[s_name] = st.sidebar.number_input(
-            f"『{s_name}』的字段名在第几行？(0为自动)", 
+            f"『{s_name}』的字段名在表B第几行？", 
             min_value=0, max_value=20, value=0, 
             key=f"row_{s_name}"
         )
@@ -193,13 +300,11 @@ if template_file:
     st.sidebar.markdown("---")
     st.sidebar.subheader("⏳ 时间格式转换确认")
     
-    # 遍历所有 Sheet 找出需要转换的时间列
     all_time_cols_in_template = []
     for s_name in xls_tpl.sheet_names:
         try:
             df_preview = pd.read_excel(xls_tpl, sheet_name=s_name, header=None, nrows=10)
-            f_h = force_header_config.get(s_name, 0)
-            h_idx, hs = (f_h-1, [str(x).strip() for x in df_preview.iloc[f_h-1].values if pd.notna(x)]) if f_h > 0 else find_headers(df_preview, custom_header_keywords)
+            _, hs = find_headers(df_preview, custom_header_keywords)
             all_time_cols_in_template.extend([h for h in hs if is_duration_col(h, custom_time_keywords)])
         except: pass
     all_time_cols_in_template = list(set(all_time_cols_in_template))
@@ -209,6 +314,54 @@ if template_file:
         all_time_cols_in_template, 
         default=all_time_cols_in_template
     )
+
+    # 🔀 完全通用的分 Sheet 规则：不内置任何行业或业务词。
+    if df_raw is not None and len(xls_tpl.sheet_names) > 1:
+        template_profiles = build_template_profiles(
+            xls_tpl, force_header_config, custom_header_keywords
+        )
+        common_route_cols = [
+            col for col in df_raw.columns
+            if any(col in p["body"].columns for p in template_profiles.values())
+        ]
+        st.sidebar.markdown("---")
+        st.sidebar.header("🧭 4. 多 Sheet 分流规则")
+        st.sidebar.info(
+            "先选择用于分 Sheet 的字段，再给每个 Sheet 勾选允许值。"
+            "同一 Sheet 的多个字段必须同时满足；同一字段勾选多个值时满足任一即可。"
+            "已存在于表B的编码/名称仍会优先自动归属。"
+        )
+        route_fields = st.sidebar.multiselect(
+            "选择分 Sheet 字段",
+            common_route_cols,
+            default=[],
+            help="优先选择分类、部门、地区、渠道、状态等取值较少且能区分 Sheet 的字段。"
+        )
+
+        for s_name in xls_tpl.sheet_names:
+            routing_rules[s_name] = {}
+            with st.sidebar.expander(f"📁 『{s_name}』允许值", expanded=False):
+                for field in route_fields:
+                    source_values = sorted({
+                        str(v).strip() for v in df_raw[field].tolist()
+                        if str(v).strip()
+                    })
+                    body = template_profiles.get(s_name, {}).get("body", pd.DataFrame())
+                    template_values = set()
+                    if field in body.columns:
+                        template_values = {
+                            normalize_text(v) for v in body[field].tolist()
+                            if normalize_text(v)
+                        }
+                    # 默认勾选该 Sheet 模板中已经出现过、且表A也存在的值。
+                    suggested = [v for v in source_values if normalize_text(v) in template_values]
+                    chosen = st.multiselect(
+                        f"{field}", source_values, default=suggested,
+                        key=f"route_{s_name}_{field}"
+                    )
+                    routing_rules[s_name][field] = {
+                        normalize_text(v) for v in chosen
+                    }
 else:
     st.sidebar.caption("⏳ 上传【表B】后，即可在此进行行号自查与时间列转换设置。")
 
@@ -216,19 +369,34 @@ else:
 if df_raw is not None and template_file:
     output = BytesIO()
     final_reports = {}
-    debug_log = {"源表字段": df_raw.columns.tolist(), "诊断": {}}
+    debug_log = {"表A有效Sheet": raw_sheet_names, "源表字段": df_raw.columns.tolist(), "诊断": {}}
+
+    # 关键修复：在写出前先把表A的每一行分配到表B唯一的目标 Sheet。
+    if not template_profiles:
+        template_profiles = build_template_profiles(
+            xls_tpl, force_header_config, custom_header_keywords
+        )
+    routed_indices, unresolved_indices = route_rows_to_template_sheets(
+        df_raw, template_profiles, routing_rules
+    )
+
+    if unresolved_indices:
+        st.warning(
+            f"⚠️ 有 {len(unresolved_indices)} 条记录无法唯一判断目标 Sheet，"
+            "为避免乱跑或重复，已不写入任何 Sheet；可在排错日志查看。"
+        )
+        debug_log["未能分Sheet的表A行号"] = [int(i) + 2 for i in unresolved_indices]
 
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
-        # 遍历表B的所有 Sheet，把表A的数据按各自的表头塞进去
         for s_name in xls_tpl.sheet_names:
-            df_tpl_meta = pd.read_excel(xls_tpl, sheet_name=s_name, header=None, nrows=10)
-            if df_tpl_meta.empty: continue
-            
-            f_h = force_header_config.get(s_name, 0)
-            h_idx, headers = (f_h-1, [str(x).strip() for x in df_tpl_meta.iloc[f_h-1].values if pd.notna(x)]) if f_h > 0 else find_headers(df_tpl_meta, custom_header_keywords)
+            if s_name not in template_profiles: continue
+            h_idx = template_profiles[s_name]["header_idx"]
+            headers = template_profiles[s_name]["headers"]
+            # 每个 Sheet 只使用已经分配给自己的表A记录，不再重复使用整张 df_raw。
+            sheet_raw = df_raw.loc[routed_indices.get(s_name, [])].reset_index(drop=True)
             
             out_df = pd.DataFrame(columns=headers)
-            raw_cols = df_raw.columns.tolist()
+            raw_cols = sheet_raw.columns.tolist()
             report = []
             
             for b_idx, col_name in enumerate(headers, 1):
@@ -243,7 +411,7 @@ if df_raw is not None and template_file:
                     if m: a_idx = raw_cols.index(m[0]); status = "ok"
                 
                 if status == "ok" and a_idx < len(df_raw.columns):
-                    series = df_raw.iloc[:, a_idx]
+                    series = sheet_raw.iloc[:, a_idx]
                     if col_name in selected_time_cols:
                         series = series.apply(parse_time_logic)
                     out_df[col_name] = series
@@ -264,12 +432,16 @@ if df_raw is not None and template_file:
                             cell.number_format = '[h]:mm:ss'
             
             final_reports[s_name] = report
-            debug_log["诊断"][s_name] = {"识别行": h_idx+1, "字段": headers}
+            debug_log["诊断"][s_name] = {
+                "识别行": h_idx+1,
+                "字段": headers,
+                "写入记录数": len(sheet_raw),
+                "表A原始行号": [int(i) + 2 for i in routed_indices.get(s_name, [])]
+            }
 
     st.markdown("---")
     st.subheader("📊 数据对齐与填充看板 (表A ➡️ 表B)")
 
-    # 渲染所有 Sheet 的对齐报告
     for s_name, report in final_reports.items():
         ok_count = sum(1 for x in report if x['s'] == 'ok')
         with st.expander(f"📁 『{s_name}』 预览 (提取成功: {ok_count} | 填充/留空: {len(report)-ok_count})"):
