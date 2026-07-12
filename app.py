@@ -126,19 +126,25 @@ with col_u1:
 with col_u2:
     template_file = st.file_uploader("📋 上传【表B：目标模板】(带有目标格式的模版)", type=["xlsx", "xls"])
 
-# ==================== 7. 读取表A与无头预警 ====================
+# ==================== 7. 读取表A与无头预警 (已修复智能侦测) ====================
 df_raw = None
 raw_sheets = {} # 用于存储表A可能包含的多个Sheet
 if raw_file:
     try:
         ext = raw_file.name.split('.')[-1].lower()
         if ext == 'csv':
-            df_raw = pd.read_csv(raw_file, dtype=str).fillna("")
+            temp_df = pd.read_csv(raw_file, header=None, nrows=20, dtype=str).fillna("")
+            a_h_idx, _ = find_headers(temp_df)
+            raw_file.seek(0)
+            df_raw = pd.read_csv(raw_file, header=a_h_idx, dtype=str).fillna("")
             raw_sheets["Sheet1"] = df_raw
         else:
             xls_raw = pd.ExcelFile(raw_file)
             for s in xls_raw.sheet_names:
-                raw_sheets[s] = pd.read_excel(xls_raw, sheet_name=s, dtype=str).fillna("")
+                # 针对表A的每一个Sheet，单独进行智能表头侦测，防止大标题干扰
+                temp_df = pd.read_excel(xls_raw, sheet_name=s, header=None, nrows=20, dtype=str).fillna("")
+                a_h_idx, _ = find_headers(temp_df)
+                raw_sheets[s] = pd.read_excel(xls_raw, sheet_name=s, header=a_h_idx, dtype=str).fillna("")
             df_raw = list(raw_sheets.values())[0] # 仅作下方非空判定兜底使用
             
         st.success(f"✅ 表A 读取成功！共读取 {len(raw_sheets)} 个 Sheet。")
@@ -215,6 +221,25 @@ if template_file:
 else:
     st.sidebar.caption("⏳ 上传【表B】后，即可在此进行行号自查与时间列转换设置。")
 
+# ==================== 8.5 侧边栏：4. 多 Sheet 智能路由 ====================
+st.sidebar.markdown("---")
+st.sidebar.header("🔄 4. 多 Sheet 数据分配 (防乱跑)")
+st.sidebar.info("👉 **用途：** 如果表B有多个Sheet，请在此手工确认：每个Sheet该读取表A的哪一部分数据？")
+sheet_mapping = {}
+
+if template_file and raw_file:
+    for s_name in xls_tpl.sheet_names:
+        options = list(raw_sheets.keys())
+        # 如果表A中有同名的sheet，默认帮用户选同名；否则默认选表A的第一个Sheet
+        default_idx = options.index(s_name) if s_name in options else 0
+        sheet_mapping[s_name] = st.sidebar.selectbox(
+            f"喂给 表B『{s_name}』的数据源是：", 
+            options, 
+            index=default_idx
+        )
+else:
+    st.sidebar.caption("⏳ 传完两张表后，防乱跑选择器将在此出现。")
+
 # ==================== 9. 执行核心映射与渲染看板 ====================
 if df_raw is not None and template_file:
     output = BytesIO()
@@ -222,23 +247,14 @@ if df_raw is not None and template_file:
     debug_log = {"诊断": {}}
 
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
-        for b_idx_sheet, s_name in enumerate(xls_tpl.sheet_names):
+        for s_name in xls_tpl.sheet_names:
             df_tpl_meta = pd.read_excel(xls_tpl, sheet_name=s_name, header=None, nrows=10)
             if df_tpl_meta.empty: continue
             
-            # ------ 智能寻找对应的 表A Sheet ------
-            if len(raw_sheets) == 1:
-                current_df_raw = list(raw_sheets.values())[0]
-            else:
-                if s_name in raw_sheets:
-                    current_df_raw = raw_sheets[s_name]
-                else:
-                    a_sheet_names = list(raw_sheets.keys())
-                    if b_idx_sheet < len(a_sheet_names):
-                        current_df_raw = raw_sheets[a_sheet_names[b_idx_sheet]]
-                    else:
-                        current_df_raw = pd.DataFrame() # 没找到对应Sheet，兜底为空表
-            # ------------------------------------
+            # ------ 根据侧边栏的路由选择，精准读取表 A 对应的数据源 ------
+            source_sheet_name = sheet_mapping.get(s_name, list(raw_sheets.keys())[0])
+            current_df_raw = raw_sheets[source_sheet_name]
+            # --------------------------------------------------------
             
             f_h = force_header_config.get(s_name, 0)
             h_idx, headers = (f_h-1, [str(x).strip() for x in df_tpl_meta.iloc[f_h-1].values if pd.notna(x)]) if f_h > 0 else find_headers(df_tpl_meta, custom_header_keywords)
