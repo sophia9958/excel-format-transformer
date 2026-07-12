@@ -126,42 +126,30 @@ with col_u1:
 with col_u2:
     template_file = st.file_uploader("📋 上传【表B：目标模板】(带有目标格式的模版)", type=["xlsx", "xls"])
 
-# ==================== 7. 读取表A与无头预警 (已修复智能侦测) ====================
+# ==================== 7. 读取表A与无头预警 ====================
 df_raw = None
-raw_sheets = {} # 用于存储表A可能包含的多个Sheet
 if raw_file:
     try:
         ext = raw_file.name.split('.')[-1].lower()
         if ext == 'csv':
-            temp_df = pd.read_csv(raw_file, header=None, nrows=20, dtype=str).fillna("")
-            a_h_idx, _ = find_headers(temp_df)
-            raw_file.seek(0)
-            df_raw = pd.read_csv(raw_file, header=a_h_idx, dtype=str).fillna("")
-            raw_sheets["Sheet1"] = df_raw
+            df_raw = pd.read_csv(raw_file, dtype=str).fillna("")
         else:
-            xls_raw = pd.ExcelFile(raw_file)
-            for s in xls_raw.sheet_names:
-                # 针对表A的每一个Sheet，单独进行智能表头侦测，防止大标题干扰
-                temp_df = pd.read_excel(xls_raw, sheet_name=s, header=None, nrows=20, dtype=str).fillna("")
-                a_h_idx, _ = find_headers(temp_df)
-                raw_sheets[s] = pd.read_excel(xls_raw, sheet_name=s, header=a_h_idx, dtype=str).fillna("")
-            df_raw = list(raw_sheets.values())[0] # 仅作下方非空判定兜底使用
+            # 暴力修正：无论表A里藏了多少个没用的Sheet，我们只认第一个！
+            df_raw = pd.read_excel(raw_file, dtype=str).fillna("") 
             
-        st.success(f"✅ 表A 读取成功！共读取 {len(raw_sheets)} 个 Sheet。")
+        st.success(f"✅ 表A 读取成功！共包含 {len(df_raw.columns)} 列数据。")
         
         # 提取无名列预览
         unnamed = []
-        for s_name, df_s in raw_sheets.items():
-            for i, col in enumerate(df_s.columns, 1):
-                if "Unnamed" in str(col) or str(col).strip() == "":
-                    sample = [str(x).strip() for x in df_s.iloc[:, i-1].tolist() if str(x).strip() != ""]
-                    unnamed.append((s_name, i, "、".join(sample[:3]) if sample else "全空"))
+        for i, col in enumerate(df_raw.columns, 1):
+            if "Unnamed" in str(col) or str(col).strip() == "":
+                sample = [str(x).strip() for x in df_raw.iloc[:, i-1].tolist() if str(x).strip() != ""]
+                unnamed.append((i, "、".join(sample[:3]) if sample else "全空"))
         
         if unnamed:
             st.warning("🚨 **表A 发现无名列！** 请根据内容预览，在左侧【手动对号修正】区指定列号：")
-            for s_name, idx, pre in unnamed: 
-                sheet_prefix = f"『{s_name}』 " if len(raw_sheets) > 1 else ""
-                st.write(f"👉 表A {sheet_prefix}第 `{idx}` 列 ➔ 内容预览: `{pre}`")
+            for idx, pre in unnamed: 
+                st.write(f"👉 表A 第 `{idx}` 列 ➔ 内容预览: `{pre}`")
     except Exception as e: 
         st.error(f"读取表A失败: {e}")
         st.stop()
@@ -221,52 +209,29 @@ if template_file:
 else:
     st.sidebar.caption("⏳ 上传【表B】后，即可在此进行行号自查与时间列转换设置。")
 
-# ==================== 8.5 侧边栏：4. 多 Sheet 智能路由 ====================
-st.sidebar.markdown("---")
-st.sidebar.header("🔄 4. 多 Sheet 数据分配 (防乱跑)")
-st.sidebar.info("👉 **用途：** 如果表B有多个Sheet，请在此手工确认：每个Sheet该读取表A的哪一部分数据？")
-sheet_mapping = {}
-
-if template_file and raw_file:
-    for s_name in xls_tpl.sheet_names:
-        options = list(raw_sheets.keys())
-        # 如果表A中有同名的sheet，默认帮用户选同名；否则默认选表A的第一个Sheet
-        default_idx = options.index(s_name) if s_name in options else 0
-        sheet_mapping[s_name] = st.sidebar.selectbox(
-            f"喂给 表B『{s_name}』的数据源是：", 
-            options, 
-            index=default_idx
-        )
-else:
-    st.sidebar.caption("⏳ 传完两张表后，防乱跑选择器将在此出现。")
-
 # ==================== 9. 执行核心映射与渲染看板 ====================
 if df_raw is not None and template_file:
     output = BytesIO()
     final_reports = {}
-    debug_log = {"诊断": {}}
+    debug_log = {"源表字段": df_raw.columns.tolist(), "诊断": {}}
 
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
         for s_name in xls_tpl.sheet_names:
             df_tpl_meta = pd.read_excel(xls_tpl, sheet_name=s_name, header=None, nrows=10)
             if df_tpl_meta.empty: continue
             
-            # ------ 根据侧边栏的路由选择，精准读取表 A 对应的数据源 ------
-            source_sheet_name = sheet_mapping.get(s_name, list(raw_sheets.keys())[0])
-            current_df_raw = raw_sheets[source_sheet_name]
-            # --------------------------------------------------------
-            
+            # 暴力修正：把表A唯一的数据源(df_raw)强行复制，喂给表B的每一个Sheet去匹配！
             f_h = force_header_config.get(s_name, 0)
             h_idx, headers = (f_h-1, [str(x).strip() for x in df_tpl_meta.iloc[f_h-1].values if pd.notna(x)]) if f_h > 0 else find_headers(df_tpl_meta, custom_header_keywords)
             
             out_df = pd.DataFrame(columns=headers)
-            raw_cols = current_df_raw.columns.tolist()
+            raw_cols = df_raw.columns.tolist()
             report = []
             
             for b_idx, col_name in enumerate(headers, 1):
                 a_idx, status = None, "empty"
                 
-                # 优先级1：手动列号映射（忽略大小写）
+                # 优先级1：手动列号映射
                 if col_name.lower() in manual_map_config:
                     a_idx = manual_map_config[col_name.lower()]; status = "ok"
                 # 优先级2：自动相似度对齐
@@ -274,8 +239,8 @@ if df_raw is not None and template_file:
                     m = difflib.get_close_matches(col_name, raw_cols, n=1, cutoff=0.4)
                     if m: a_idx = raw_cols.index(m[0]); status = "ok"
                 
-                if status == "ok" and a_idx < len(current_df_raw.columns):
-                    series = current_df_raw.iloc[:, a_idx]
+                if status == "ok" and a_idx < len(df_raw.columns):
+                    series = df_raw.iloc[:, a_idx]
                     if col_name in selected_time_cols:
                         series = series.apply(parse_time_logic)
                     out_df[col_name] = series
@@ -296,7 +261,7 @@ if df_raw is not None and template_file:
                             cell.number_format = '[h]:mm:ss'
             
             final_reports[s_name] = report
-            debug_log["诊断"][s_name] = {"识别行": h_idx+1, "表A对应字段": raw_cols, "表B字段": headers}
+            debug_log["诊断"][s_name] = {"识别行": h_idx+1, "表B字段": headers}
 
     st.markdown("---")
     st.subheader("📊 数据对齐与填充看板 (表A ➡️ 表B)")
