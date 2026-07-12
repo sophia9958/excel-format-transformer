@@ -440,20 +440,30 @@ if df_raw is not None and template_file:
             }
 
     st.markdown("---")
-    st.subheader("📊 数据对齐与填充看板 (表A ➡️ 表B)")
+    st.subheader("📊 转换结果预览（表A数据 ➡️ 表B各目标 Sheet）")
+    st.info(
+        "📌 下方『名称』都是表B的目标 Sheet 名。"
+        "“写入数据”是行数；“成功匹配”和“填充/留空”是字段（列）数。"
+    )
 
     for s_name, report in final_reports.items():
         ok_count = sum(1 for x in report if x['s'] == 'ok')
-        with st.expander(f"📁 『{s_name}』 预览 (提取成功: {ok_count} | 填充/留空: {len(report)-ok_count})"):
+        row_count = len(routed_indices.get(s_name, []))
+        with st.expander(
+            f"📁 表B目标 Sheet『{s_name}』｜写入数据：{row_count} 条｜"
+            f"成功匹配：{ok_count} 个字段｜填充/留空：{len(report)-ok_count} 个字段"
+        ):
+            if row_count == 0:
+                st.warning("此目标 Sheet 本次没有符合分流规则的表A数据，因此只会保留字段结构，不会写入数据行。")
             c1, c2 = st.columns(2)
             with c1:
-                st.write("🟢 **a表提取成功**")
+                st.write("🟢 **成功匹配的字段（表A列 ➡️ 表B列）**")
                 for x in [item for item in report if item['s'] == 'ok']:
                     st.write(f"A第`{x['a']}`列({x['an']}) ➔ B第`{x['b']}`列({x['bn']})")
                 if not any(item['s'] == 'ok' for item in report):
-                    st.caption("没有成功从表A提取的数据。")
+                    st.caption("没有成功匹配的字段。")
             with c2:
-                st.write("🟡 **b表填充或空**")
+                st.write("🟡 **表B中使用默认值或留空的字段**")
                 for x in [item for item in report if item['s'] != 'ok']:
                     val_text = f"填: `{x['f']}`" if x['f'] else "留空"
                     st.write(f"B第`{x['b']}`列({x['bn']}) ➔ {val_text}")
